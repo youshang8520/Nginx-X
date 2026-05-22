@@ -290,17 +290,6 @@ version_gt() {
   [[ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -n1)" == "$1" && "$1" != "$2" ]]
 }
 
-
-mapfile_compat() {
-  local __dest="$1"
-  local __line
-  eval "$__dest=()"
-  while IFS= read -r __line; do
-    eval "$__dest+=("\$__line")"
-  done
-  eval ': "${'"$__dest"'[@]+_}"'
-}
-
 # ---------- 功能1：安装与初始化 ----------
 install_nginx_official() {
   local os_id pkg
@@ -1515,13 +1504,20 @@ list_all_conf_files() {
 
 print_conf_list() {
   local i=1
-  local -a enabled_files disabled_files
+  local -a enabled_files=()
+  local -a disabled_files=()
 
   # 二级列表：先显示已启用（.conf），再显示已停用（.bak/其他后缀）
   mapfile_compat enabled_files < <(list_managed_conf_files 0 | xargs -r -n1 basename)
   mapfile_compat disabled_files < <(list_managed_conf_files 1 | xargs -r -n1 basename | grep -E '\.conf\..+$' || true)
 
-  FILES=("${enabled_files[@]}" "${disabled_files[@]}")
+  FILES=()
+if [[ ${enabled_files[@]+_} ]]; then
+  FILES+=("${enabled_files[@]}")
+fi
+if [[ ${disabled_files[@]+_} ]]; then
+  FILES+=("${disabled_files[@]}")
+fi
 
   if [[ ${#FILES[@]} -eq 0 ]]; then
     warn "当前没有可管理的配置文件。你可以先去 [添加配置] 或 [外部反代] 创建一个站点。"
