@@ -298,6 +298,7 @@ mapfile_compat() {
   while IFS= read -r __line; do
     eval "$__dest+=("\$__line")"
   done
+  eval ': "${'"$__dest"'[@]+_}"'
 }
 
 # ---------- 功能1：安装与初始化 ----------
