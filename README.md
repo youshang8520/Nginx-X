@@ -14,13 +14,13 @@
 ### 方式一：一键安装（推荐）
 
 ```bash
-bash -c "$(curl -fsSL https://raw.githubusercontent.com/Xiuyixx/Nginx-X/main/install.sh)"
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/youshang8520/Nginx-X/main/install.sh)"
 ```
 
 ### 方式二：手动安装
 
 ```bash
-git clone https://github.com/Xiuyixx/Nginx-X.git
+git clone https://github.com/youshang8520/Nginx-X.git
 cd Nginx-X
 bash install.sh
 ```
