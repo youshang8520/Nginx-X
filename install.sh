@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-REPO_URL="https://github.com/youshang8520/Nginx-X.git"
+REPO_URL="https://github.com/YOUR_GITHUB_USERNAME/Nginx-X.git"
 INSTALL_DIR="/opt/Nginx-X"
 TARGET_BIN="/usr/local/bin/nx"
 NO_RUN="0"
@@ -77,15 +77,31 @@ install_local() {
 }
 
 bootstrap_install() {
+  local current_remote=""
   echo "[INFO] 开始一键安装 Nginx-X..."
 
   install_git_if_needed
 
   if [[ -d "$INSTALL_DIR/.git" ]]; then
-    echo "[INFO] 检测到已安装目录，正在更新到最新版本..."
-    if ! ${SUDO} git -C "$INSTALL_DIR" pull --ff-only; then
-      echo "[ERROR] 拉取最新代码失败。请检查网络连接、GitHub 可达性，或稍后重试。"
-      exit 1
+    echo "[INFO] 检测到已安装目录，检查仓库来源..."
+    current_remote="$(${SUDO} bash -c "cd '$INSTALL_DIR' && git config --get remote.origin.url" 2>/dev/null || true)"
+
+    if [[ "$current_remote" != "$REPO_URL" ]]; then
+      echo "[WARN] 已安装目录指向的仓库不是当前目标仓库。"
+      echo "[WARN] current: ${current_remote:-<empty>}"
+      echo "[WARN] target : $REPO_URL"
+      echo "[INFO] 将自动删除旧目录并重新克隆目标仓库..."
+      ${SUDO} rm -rf "$INSTALL_DIR"
+      if ! ${SUDO} git clone "$REPO_URL" "$INSTALL_DIR"; then
+        echo "[ERROR] 克隆仓库失败。请检查网络连接、GitHub 可达性，或稍后重试。"
+        exit 1
+      fi
+    else
+      echo "[INFO] 检测到目标仓库一致，正在更新到最新版本..."
+      if ! ${SUDO} bash -c "cd '$INSTALL_DIR' && git pull --ff-only"; then
+        echo "[ERROR] 拉取最新代码失败。请检查网络连接、GitHub 可达性，或稍后重试。"
+        exit 1
+      fi
     fi
   elif [[ -e "$INSTALL_DIR" ]]; then
     echo "[WARN] 目标目录已存在，但不是 Git 仓库：$INSTALL_DIR"
