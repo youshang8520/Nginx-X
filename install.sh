@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-REPO_URL="https://github.com/Xiuyixx/Nginx-X.git"
+REPO_URL="https://github.com/youshang8520/Nginx-X.git"
 INSTALL_DIR="/opt/Nginx-X"
 TARGET_BIN="/usr/local/bin/nx"
 NO_RUN="0"
@@ -65,6 +65,7 @@ install_local() {
   ${SUDO} install -m 0755 "$source_script" "$TARGET_BIN"
 
   echo "[OK] Installed. You can now run: nx"
+  echo "[INFO] Source repo: ${REPO_URL}"
 
   # 如果当前在交互终端，安装后直接进入菜单，免去手动再输入 nx
   if [[ "$NO_RUN" != "1" && -t 0 && -t 1 ]]; then
@@ -168,3 +169,5 @@ if has_local_nx; then
 else
   bootstrap_install
 fi
+
+    
