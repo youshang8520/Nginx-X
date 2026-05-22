@@ -169,5 +169,3 @@ if has_local_nx; then
 else
   bootstrap_install
 fi
-
-    
