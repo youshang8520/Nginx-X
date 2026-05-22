@@ -91,6 +91,10 @@ bootstrap_install() {
       echo "[WARN] current: ${current_remote:-<empty>}"
       echo "[WARN] target : $REPO_URL"
       echo "[INFO] 将自动删除旧目录并重新克隆目标仓库..."
+      if ! cd /; then
+        echo "[ERROR] 无法切换到安全目录 /"
+        exit 1
+      fi
       ${SUDO} rm -rf "$INSTALL_DIR"
       if ! ${SUDO} git clone "$REPO_URL" "$INSTALL_DIR"; then
         echo "[ERROR] 克隆仓库失败。请检查网络连接、GitHub 可达性，或稍后重试。"
