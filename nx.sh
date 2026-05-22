@@ -408,7 +408,11 @@ upgrade_nginx_smart() {
       # Try a quick curl probe to classify failure (best-effort)
       local probe_rc=0
       curl -fsSL --connect-timeout 4 --max-time 8 -A 'Nginx-X version-check' https://nginx.org/en/download.html >/dev/null 2>&1 || probe_rc=$?
-      warn "无法获取官方最新版本（nginx.org 访问失败或解析失败：$(curl_error_hint "$probe_rc")），将改为直接通过包管理器检查并尝试升级。"
+      if [[ "$probe_rc" -eq 0 ]]; then
+        warn "已访问 nginx.org，但未能解析出官方最新版本，将改为通过包管理器检查升级。"
+      else
+        warn "无法访问 nginx.org（$(curl_error_hint "$probe_rc")），将改为通过包管理器检查升级。"
+      fi
       using_official_repo="0"
     else
       note "官方最新：${latest_ver}"
@@ -468,7 +472,13 @@ upgrade_nginx_smart() {
 
   if nginx_test; then
     reload_nginx_safe
-    info "Nginx 已平滑升级完成。"
+    local local_ver_after
+    local_ver_after="$(nginx_local_version)"
+    if [[ "$local_ver_after" != "$local_ver" ]]; then
+      info "Nginx 已从 ${local_ver} 升级到 ${local_ver_after}。"
+    else
+      info "已执行升级检查，当前仍为 ${local_ver_after}（仓库无更新或已是最新）。"
+    fi
   else
     error "升级后配置校验失败，请检查。备份目录：${backup_dir}"
     ${SUDO} nginx -t || true
@@ -2401,7 +2411,7 @@ ensure_acme_location_for_domain_conf() {
 
   # Collect tmp files so early-return / errors won't leak /tmp files
   local -a tmp_files=()
-  trap 'for f in "${tmp_files[@]}"; do rm -f "$f" 2>/dev/null || true; done' RETURN
+  trap 'for f in ${tmp_files+"${tmp_files[@]}"}; do rm -f "$f" 2>/dev/null || true; done' RETURN
 
   # Primary: match our metadata line "# domain=<domain>"
   mapfile -t matches < <(awk -v d="$domain" 'FNR==1{found=0} $0=="# domain=" d {found=1} ENDFILE{if(found) print FILENAME}' "${CONF_DIR}"/*.conf 2>/dev/null || true)
