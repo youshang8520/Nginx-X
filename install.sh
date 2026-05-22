@@ -178,9 +178,14 @@ for arg in "$@"; do
 done
 
 # 统一入口：
+# - 远程一键执行时，强制走 bootstrap，避免误把当前目录当成本地仓库
 # - 在仓库目录执行（存在 nx.sh）=> 本地安装
-# - 通过 curl 一键执行（通常无 nx.sh）=> 引导克隆后安装
-if has_local_nx; then
+# - 其他情况 => 引导克隆后安装
+if [[ "${FORCE_BOOTSTRAP:-0}" == "1" ]]; then
+  bootstrap_install
+elif [[ ${BASH_SOURCE[0]-} == "" || ! -e ${BASH_SOURCE[0]-} ]]; then
+  bootstrap_install
+elif has_local_nx; then
   install_local
 else
   bootstrap_install
