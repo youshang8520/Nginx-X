@@ -2431,7 +2431,7 @@ ensure_acme_location_for_domain_conf() {
 
   # Collect tmp files so early-return / errors won't leak /tmp files
   local -a tmp_files=()
-  trap 'for f in ${tmp_files+"${tmp_files[@]}"}; do rm -f "$f" 2>/dev/null || true; done' RETURN
+  trap 'for f in ${tmp_files+"${tmp_files[*]}"}; do rm -f "$f" 2>/dev/null || true; done' RETURN
 
   # Primary: match our metadata line "# domain=<domain>"
   mapfile_compat matches < <(awk -v d="$domain" 'FNR==1{found=0} $0=="# domain=" d {found=1} ENDFILE{if(found) print FILENAME}' "${CONF_DIR}"/*.conf 2>/dev/null || true)
