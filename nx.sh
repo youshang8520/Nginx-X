@@ -290,6 +290,16 @@ version_gt() {
   [[ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -n1)" == "$1" && "$1" != "$2" ]]
 }
 
+mapfile_compat() {
+  local __dest="$1"
+  local __line
+  eval "$__dest=()"
+  while IFS= read -r __line; do
+    eval "$__dest+=("\$__line")"
+  done
+  eval ': "${'"$__dest"'[@]+_}"'
+}
+
 # ---------- 功能1：安装与初始化 ----------
 install_nginx_official() {
   local os_id pkg
