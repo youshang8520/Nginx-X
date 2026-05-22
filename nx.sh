@@ -290,6 +290,16 @@ version_gt() {
   [[ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -n1)" == "$1" && "$1" != "$2" ]]
 }
 
+
+mapfile_compat() {
+  local __dest="$1"
+  local __line
+  eval "$__dest=()"
+  while IFS= read -r __line; do
+    eval "$__dest+=("\$__line")"
+  done
+}
+
 # ---------- 功能1：安装与初始化 ----------
 install_nginx_official() {
   local os_id pkg
@@ -747,11 +757,24 @@ normalize_url_list() {
 
 stream_urls_to_array() {
   local raw="$1"
-  local -n _out="$2"
+  local out_name="$2"
+  local -a tmp_arr=()
+  local item
 
-  _out=()
-  [[ -z "$raw" ]] && return 0
-  IFS='|' read -r -a _out <<< "$raw"
+  [[ -z "$out_name" ]] && return 1
+  [[ -z "$raw" ]] && {
+    eval "$out_name=()"
+    return 0
+  }
+
+  IFS='|' read -r -a tmp_arr <<< "$raw"
+
+  eval "$out_name=()"
+  for item in "${tmp_arr[@]}"; do
+    item="${item#"${item%%[![:space:]]*}"}"
+    item="${item%"${item##*[![:space:]]}"}"
+    eval "$out_name+=("\$item")"
+  done
 }
 
 external_mode_name() {
@@ -1494,8 +1517,8 @@ print_conf_list() {
   local -a enabled_files disabled_files
 
   # 二级列表：先显示已启用（.conf），再显示已停用（.bak/其他后缀）
-  mapfile -t enabled_files < <(list_managed_conf_files 0 | xargs -r -n1 basename)
-  mapfile -t disabled_files < <(list_managed_conf_files 1 | xargs -r -n1 basename | grep -E '\.conf\..+$' || true)
+  mapfile_compat enabled_files < <(list_managed_conf_files 0 | xargs -r -n1 basename)
+  mapfile_compat disabled_files < <(list_managed_conf_files 1 | xargs -r -n1 basename | grep -E '\.conf\..+$' || true)
 
   FILES=("${enabled_files[@]}" "${disabled_files[@]}")
 
@@ -2212,7 +2235,7 @@ import_single_conf() {
 
 import_existing_confs() {
   local -a unmanaged
-  mapfile -t unmanaged < <(_scan_unmanaged_confs)
+  mapfile_compat unmanaged < <(_scan_unmanaged_confs)
 
   if [[ ${#unmanaged[@]} -eq 0 ]]; then
     info "未发现需要导入的已有配置。"
@@ -2255,7 +2278,7 @@ import_existing_confs() {
 # 安装完成后自动检测并提示导入
 auto_import_after_install() {
   local -a unmanaged
-  mapfile -t unmanaged < <(_scan_unmanaged_confs)
+  mapfile_compat unmanaged < <(_scan_unmanaged_confs)
   [[ ${#unmanaged[@]} -eq 0 ]] && return 0
 
   echo ""
@@ -2414,11 +2437,11 @@ ensure_acme_location_for_domain_conf() {
   trap 'for f in ${tmp_files+"${tmp_files[@]}"}; do rm -f "$f" 2>/dev/null || true; done' RETURN
 
   # Primary: match our metadata line "# domain=<domain>"
-  mapfile -t matches < <(awk -v d="$domain" 'FNR==1{found=0} $0=="# domain=" d {found=1} ENDFILE{if(found) print FILENAME}' "${CONF_DIR}"/*.conf 2>/dev/null || true)
+  mapfile_compat matches < <(awk -v d="$domain" 'FNR==1{found=0} $0=="# domain=" d {found=1} ENDFILE{if(found) print FILENAME}' "${CONF_DIR}"/*.conf 2>/dev/null || true)
 
   # Fallback: match server_name token containing the domain (best-effort, avoids missing metadata)
   if [[ ${#matches[@]} -eq 0 ]]; then
-    mapfile -t matches < <(awk -v d="$domain" '
+    mapfile_compat matches < <(awk -v d="$domain" '
       BEGIN{in_server=0; hasDomain=0}
       /server\s*\{/ {in_server=1; hasDomain=0}
       in_server && index($0, "server_name") {
@@ -2721,7 +2744,7 @@ cert_list_action_menu() {
         ;;
       3)
         local -a refs
-        mapfile -t refs < <(cert_referenced_confs "$domain")
+        mapfile_compat refs < <(cert_referenced_confs "$domain")
         if [[ ${#refs[@]} -gt 0 ]]; then
           warn "证书 ${domain} 仍被以下 Nginx 配置引用，已拒绝删除："
           local ref
@@ -2800,7 +2823,7 @@ cert_list_menu() {
 
   local -a certs
   local domain idx renew_status
-  mapfile -t certs < <(
+  mapfile_compat certs < <(
     "$HOME/.acme.sh/acme.sh" --list 2>/dev/null | awk 'NR>1 && NF>0 {print $1}'
   )
 
@@ -2838,7 +2861,7 @@ cert_list_menu() {
     cert_list_action_menu "$domain"
 
     # 操作后刷新证书列表
-    mapfile -t certs < <(
+    mapfile_compat certs < <(
       "$HOME/.acme.sh/acme.sh" --list 2>/dev/null | awk 'NR>1 && NF>0 {print $1}'
     )
     if [[ ${#certs[@]} -eq 0 ]]; then
@@ -3033,7 +3056,7 @@ site_health_menu() {
     case "$c" in
       1)
         clear
-        mapfile -t confs < <(list_managed_conf_files 0)
+        mapfile_compat confs < <(list_managed_conf_files 0)
         if [[ ${#confs[@]} -eq 0 ]]; then
           warn "当前没有可检查的站点配置。请先创建站点。"
           pause
@@ -3057,7 +3080,7 @@ site_health_menu() {
         ;;
       2)
         clear
-        mapfile -t confs < <(list_managed_conf_files 0)
+        mapfile_compat confs < <(list_managed_conf_files 0)
         if [[ ${#confs[@]} -eq 0 ]]; then
           warn "当前没有可检查的站点配置。请先创建站点。"
           pause
@@ -3214,7 +3237,7 @@ enable_https_from_config_list() {
   local -a confs
   local idx conf_file domain
 
-  mapfile -t confs < <(list_managed_conf_files 0)
+  mapfile_compat confs < <(list_managed_conf_files 0)
   if [[ ${#confs[@]} -eq 0 ]]; then
     warn "未找到可启用 HTTPS 的配置文件。"
     return 1
@@ -3288,7 +3311,7 @@ enable_https_for_domain_value() {
   local -a matches
   local idx conf_file
 
-  mapfile -t matches < <(awk -v d="$domain" 'FNR==1{found=0} $0=="# domain=" d {found=1} ENDFILE{if(found) print FILENAME}' "${CONF_DIR}"/*.conf 2>/dev/null || true)
+  mapfile_compat matches < <(awk -v d="$domain" 'FNR==1{found=0} $0=="# domain=" d {found=1} ENDFILE{if(found) print FILENAME}' "${CONF_DIR}"/*.conf 2>/dev/null || true)
 
   if [[ ${#matches[@]} -eq 0 ]]; then
     error "未找到该域名对应配置：${domain}"
@@ -3696,7 +3719,7 @@ TX速率: ${tx_rate} MB/s
 当前启用配置流量（最近5000日志，优先按 Host 专用日志统计）
 EOF
 
-    mapfile -t enabled_confs < <(list_managed_conf_files 0)
+    mapfile_compat enabled_confs < <(list_managed_conf_files 0)
     if [[ ${#enabled_confs[@]} -eq 0 ]]; then
       echo "- 无启用配置"
     else
