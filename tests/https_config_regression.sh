@@ -11,6 +11,9 @@ MOCK_BIN="$TMPDIR_ROOT/bin"
 mkdir -p "$MOCK_BIN"
 cat > "$MOCK_BIN/nginx" <<'EOF'
 #!/usr/bin/env bash
+if [[ "${NGINX_MOCK_FAIL:-0}" == "1" ]]; then
+  exit 1
+fi
 exit 0
 EOF
 cat > "$MOCK_BIN/systemctl" <<'EOF'
@@ -150,6 +153,25 @@ if validate_importable_conf "$multi_server_conf" >/dev/null 2>&1; then
   echo "multi-server config should be rejected by import validation" >&2
   exit 1
 fi
+
+rollback_import_conf="$CONF_DIR/rollback-import.conf"
+cat > "$rollback_import_conf" <<'EOF'
+server {
+    listen 80;
+    server_name rollback.example.com;
+    location / { proxy_pass http://127.0.0.1:3000; }
+}
+EOF
+if NGINX_MOCK_FAIL=1 import_single_conf "$rollback_import_conf" >/dev/null 2>&1; then
+  echo "import should fail when nginx -t fails" >&2
+  exit 1
+fi
+[[ -f "$rollback_import_conf" ]]
+if grep -q '^# managed_by=Nginx-X$' "$rollback_import_conf"; then
+  echo "failed import should restore original unmanaged config" >&2
+  exit 1
+fi
+[[ ! -f "$CONF_DIR/rollback.example.com-80.conf" ]]
 
 cert_ref_conf="$CONF_DIR/cert-ref.conf"
 cat > "$cert_ref_conf" <<EOF
