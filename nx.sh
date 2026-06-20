@@ -1879,7 +1879,7 @@ add_reverse_proxy() {
         fi
       fi
     else
-      if confirm "是否立即自动申请证书并启用 HTTPS（80 强制跳转 443）？"; then
+      if confirm "是否立即自动申请证书并启用 HTTPS（80 强制跳转到目标 HTTPS 端口）？"; then
         # 在当前界面直接设置/保存邮箱（若未设置）
         if ! ensure_email_interactive; then
           warn "邮箱未设置成功，已跳过自动证书流程。你可稍后在证书管理里设置。"
@@ -2029,7 +2029,7 @@ add_external_url_proxy() {
         fi
       fi
     else
-      if confirm "是否立即自动申请证书并启用 HTTPS（80 强制跳转 443）？"; then
+      if confirm "是否立即自动申请证书并启用 HTTPS（80 强制跳转到目标 HTTPS 端口）？"; then
         if ! ensure_email_interactive; then
           warn "邮箱未设置成功，已跳过自动证书流程。你可稍后在证书管理里设置。"
         else

@@ -251,6 +251,31 @@ fi
 # shellcheck disable=SC2016
 grep -Fq 'return 301 https://$host$request_uri;' "$http_conf"
 
+custom_https_conf="$TMPDIR_ROOT/http-4443.conf"
+cat > "$custom_https_conf" <<'EOF'
+# managed_by=Nginx-X
+# domain=example.com
+# listen_port=4443
+# backend_port=3000
+server {
+    listen 4443;
+    server_name example.com;
+
+    location / {
+        proxy_pass http://127.0.0.1:3000;
+    }
+}
+EOF
+
+enable_https_for_conf_file "example.com" "$custom_https_conf" "4443"
+grep -q '^# listen_port=4443$' "$custom_https_conf"
+grep -q 'listen 4443 ssl http2;' "$custom_https_conf"
+grep -q 'listen \[::\]:4443 ssl http2;' "$custom_https_conf"
+# shellcheck disable=SC2016
+grep -Fq 'return 301 https://$host:4443$request_uri;' "$custom_https_conf"
+grep -q "ssl_certificate     ${SSL_DIR}/example.com/fullchain.pem;" "$custom_https_conf"
+grep -q "ssl_certificate_key ${SSL_DIR}/example.com/privkey.pem;" "$custom_https_conf"
+
 # URL parsing: IPv6 host extraction should handle bracketed addresses.
 [[ "$(url_host 'http://[2001:db8::1]:8080/path')" == "2001:db8::1" ]]
 [[ "$(url_host 'https://example.com:8443/a/b')" == "example.com" ]]
