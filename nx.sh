@@ -21,6 +21,7 @@ SSL_DIR="/etc/nginx/ssl"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 STATE_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/nginxx"
 EMAIL_CONF="${STATE_DIR}/email.conf"
+FIREWALL_STATE="${STATE_DIR}/firewall-opened.conf"
 
 SUDO=""
 if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
@@ -156,6 +157,230 @@ EOF
 
 ensure_state_dir() {
   mkdir -p "$STATE_DIR"
+}
+
+firewall_state_add() {
+  local backend="$1"
+  local item="$2"
+  ensure_state_dir
+  touch "$FIREWALL_STATE"
+  grep -Fxq "${backend}|${item}" "$FIREWALL_STATE" 2>/dev/null || echo "${backend}|${item}" >> "$FIREWALL_STATE"
+}
+
+firewall_state_remove() {
+  local backend="$1"
+  local item="$2"
+  [[ -f "$FIREWALL_STATE" ]] || return 0
+  grep -Fxv "${backend}|${item}" "$FIREWALL_STATE" > "${FIREWALL_STATE}.tmp" 2>/dev/null || true
+  mv "${FIREWALL_STATE}.tmp" "$FIREWALL_STATE"
+}
+
+firewall_state_has() {
+  local backend="$1"
+  local item="$2"
+  grep -Fxq "${backend}|${item}" "$FIREWALL_STATE" 2>/dev/null
+}
+
+firewall_backend() {
+  if check_cmd firewall-cmd && firewall-cmd --state >/dev/null 2>&1; then
+    echo "firewalld"
+  elif check_cmd ufw && ufw status 2>/dev/null | grep -qi '^Status: active'; then
+    echo "ufw"
+  else
+    echo "none"
+  fi
+}
+
+ensure_firewalld_running() {
+  check_cmd firewall-cmd || return 1
+  firewall-cmd --state >/dev/null 2>&1 && return 0
+
+  if check_cmd systemctl; then
+    note "检测到 firewalld 未运行，正在尝试通过 systemctl 启动。"
+    ${SUDO} systemctl enable --now firewalld >/dev/null 2>&1 || return 1
+  else
+    note "检测到 firewalld 未运行，正在尝试启动服务。"
+    ${SUDO} service firewalld start >/dev/null 2>&1 || return 1
+  fi
+
+  firewall-cmd --state >/dev/null 2>&1
+}
+
+firewall_item_for_port() {
+  local port="$1"
+  case "$port" in
+    80) echo "service:http" ;;
+    443) echo "service:https" ;;
+    *) echo "port:${port}/tcp" ;;
+  esac
+}
+
+firewall_item_open() {
+  local backend="$1"
+  local item="$2"
+
+  case "$backend" in
+    firewalld)
+      if [[ "$item" == service:* ]]; then
+        firewall-cmd --query-service="${item#service:}" >/dev/null 2>&1
+      else
+        firewall-cmd --query-port="${item#port:}" >/dev/null 2>&1
+      fi
+      ;;
+    ufw)
+      if [[ "$item" == service:http ]]; then
+        ufw status 2>/dev/null | grep -Eq '(^|[[:space:]])80/tcp[[:space:]]+ALLOW'
+      elif [[ "$item" == service:https ]]; then
+        ufw status 2>/dev/null | grep -Eq '(^|[[:space:]])443/tcp[[:space:]]+ALLOW'
+      else
+        ufw status 2>/dev/null | grep -Eq "(^|[[:space:]])${item#port:}[[:space:]]+ALLOW"
+      fi
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+firewall_open_item() {
+  local backend="$1"
+  local item="$2"
+
+  firewall_item_open "$backend" "$item" && return 0
+
+  case "$backend" in
+    firewalld)
+      if [[ "$item" == service:* ]]; then
+        ${SUDO} firewall-cmd --permanent --add-service="${item#service:}" >/dev/null || return 1
+      else
+        ${SUDO} firewall-cmd --permanent --add-port="${item#port:}" >/dev/null || return 1
+      fi
+      ${SUDO} firewall-cmd --reload >/dev/null || return 1
+      ;;
+    ufw)
+      if [[ "$item" == service:http ]]; then
+        ${SUDO} ufw allow 80/tcp >/dev/null || return 1
+      elif [[ "$item" == service:https ]]; then
+        ${SUDO} ufw allow 443/tcp >/dev/null || return 1
+      else
+        ${SUDO} ufw allow "${item#port:}" >/dev/null || return 1
+      fi
+      ;;
+    *) return 1 ;;
+  esac
+
+  firewall_state_add "$backend" "$item"
+  return 0
+}
+
+firewall_close_item_if_owned() {
+  local backend="$1"
+  local item="$2"
+
+  firewall_state_has "$backend" "$item" || return 0
+
+  case "$backend" in
+    firewalld)
+      if [[ "$item" == service:* ]]; then
+        ${SUDO} firewall-cmd --permanent --remove-service="${item#service:}" >/dev/null 2>&1 || true
+      else
+        ${SUDO} firewall-cmd --permanent --remove-port="${item#port:}" >/dev/null 2>&1 || true
+      fi
+      ${SUDO} firewall-cmd --reload >/dev/null 2>&1 || true
+      ;;
+    ufw)
+      if [[ "$item" == service:http ]]; then
+        ${SUDO} ufw delete allow 80/tcp >/dev/null 2>&1 || true
+      elif [[ "$item" == service:https ]]; then
+        ${SUDO} ufw delete allow 443/tcp >/dev/null 2>&1 || true
+      else
+        ${SUDO} ufw delete allow "${item#port:}" >/dev/null 2>&1 || true
+      fi
+      ;;
+  esac
+
+  firewall_state_remove "$backend" "$item"
+}
+
+enabled_configs_using_port() {
+  local port="$1"
+  grep -R -l -E "listen[[:space:]]+(\\[::\\]:)?${port}([[:space:]]|;)" "${CONF_DIR}"/*.conf 2>/dev/null || true
+}
+
+conf_listen_ports() {
+  local conf_file="$1"
+  grep -E '^[[:space:]]*listen[[:space:]]+' "$conf_file" 2>/dev/null \
+    | sed -E 's/.*listen[[:space:]]+(\[::\]:)?([0-9]+).*/\2/' \
+    | grep -E '^[0-9]+$' \
+    | sort -u || true
+}
+
+ensure_firewall_port_open() {
+  local port="$1"
+  local backend item
+
+  valid_port "$port" || return 0
+  if check_cmd firewall-cmd && ! firewall-cmd --state >/dev/null 2>&1; then
+    ensure_firewalld_running || true
+  fi
+  backend="$(firewall_backend)"
+  item="$(firewall_item_for_port "$port")"
+
+  if [[ "$backend" == "none" ]]; then
+    warn "未检测到已启用的 firewalld/ufw，无法自动放行端口 ${port}。请确认云安全组和系统防火墙已放行。"
+    return 0
+  fi
+
+  if firewall_item_open "$backend" "$item"; then
+    return 0
+  fi
+
+  note "检测到防火墙未放行端口 ${port}，正在自动开放。"
+  if firewall_open_item "$backend" "$item"; then
+    info "已自动开放端口 ${port}（${backend}）。"
+  else
+    warn "自动开放端口 ${port} 失败，请手动检查防火墙。"
+  fi
+}
+
+release_firewall_port_if_unused() {
+  local port="$1"
+  local backend item
+
+  valid_port "$port" || return 0
+  backend="$(firewall_backend)"
+  [[ "$backend" == "none" ]] && return 0
+  item="$(firewall_item_for_port "$port")"
+
+  if [[ -n "$(enabled_configs_using_port "$port")" ]]; then
+    return 0
+  fi
+
+  firewall_close_item_if_owned "$backend" "$item"
+}
+
+ensure_firewall_for_conf() {
+  local conf_file="$1"
+  local port
+  while IFS= read -r port; do
+    [[ -n "$port" ]] && ensure_firewall_port_open "$port"
+  done < <(conf_listen_ports "$conf_file")
+}
+
+release_firewall_for_ports_if_unused() {
+  local ports="$1"
+  local port
+  while IFS= read -r port; do
+    [[ -n "$port" ]] && release_firewall_port_if_unused "$port"
+  done <<< "$ports"
+}
+
+release_all_owned_firewall_rules() {
+  [[ -f "$FIREWALL_STATE" ]] || return 0
+  local backend item
+  while IFS='|' read -r backend item; do
+    [[ -n "$backend" && -n "$item" ]] || continue
+    firewall_close_item_if_owned "$backend" "$item"
+  done < "$FIREWALL_STATE"
+  rm -f "$FIREWALL_STATE" 2>/dev/null || true
 }
 
 disable_default_conf_if_exists() {
@@ -578,6 +803,16 @@ is_port_used_os() {
   ss -lnt "( sport = :${p} )" 2>/dev/null | awk 'NR>1{print}' | grep -q .
 }
 
+port_used_ipv4() {
+  local p="$1"
+  ss -H -ltn4 "( sport = :${p} )" 2>/dev/null | grep -q .
+}
+
+port_used_ipv6() {
+  local p="$1"
+  ss -H -ltn6 "( sport = :${p} )" 2>/dev/null | grep -q .
+}
+
 port_has_ssl_listener() {
   local p="$1"
   grep -R -E "listen[[:space:]]+${p}([[:space:]]|;).*ssl" "${CONF_DIR}"/*.conf >/dev/null 2>&1
@@ -702,6 +937,150 @@ ipv6_available() {
   return 0
 }
 
+public_ipv6_addresses() {
+  ipv6_available || return 0
+  ip -o -6 addr show scope global 2>/dev/null \
+    | awk '{print $4}' \
+    | cut -d/ -f1 \
+    | grep -E '^[0-9a-fA-F:]+$' \
+    | grep -viE '^(fe80:|fc|fd|::1$)' \
+    | sort -u || true
+}
+
+dns_aaaa_records() {
+  local domain="$1"
+
+  if check_cmd dig; then
+    dig +short AAAA "$domain" 2>/dev/null | grep -E '^[0-9a-fA-F:]+$' | sort -u || true
+    return 0
+  fi
+
+  getent ahosts "$domain" 2>/dev/null \
+    | awk '$1 ~ /:/ {print $1}' \
+    | sort -u || true
+}
+
+domain_has_local_aaaa() {
+  local domain="$1"
+  local local_ip dns_ip
+
+  while IFS= read -r local_ip; do
+    [[ -n "$local_ip" ]] || continue
+    while IFS= read -r dns_ip; do
+      [[ "$dns_ip" == "$local_ip" ]] && return 0
+    done < <(dns_aaaa_records "$domain")
+  done < <(public_ipv6_addresses)
+
+  return 1
+}
+
+domain_has_aaaa_ip() {
+  local domain="$1"
+  local expected_ip="$2"
+  local dns_ip
+
+  while IFS= read -r dns_ip; do
+    [[ "$dns_ip" == "$expected_ip" ]] && return 0
+  done < <(dns_aaaa_records "$domain")
+
+  return 1
+}
+
+select_public_ipv6() {
+  local out_name="$1"
+  local -a ips=()
+  local ip ans
+
+  while IFS= read -r ip; do
+    [[ -n "$ip" ]] && ips+=("$ip")
+  done < <(public_ipv6_addresses)
+
+  if [[ ${#ips[@]} -eq 0 ]]; then
+    return 1
+  fi
+
+  if [[ ${#ips[@]} -eq 1 ]]; then
+    eval "$out_name=\"${ips[0]}\""
+    return 0
+  fi
+
+  note "检测到多个公网 IPv6 地址，请选择用于域名 AAAA 解析的地址："
+  local i
+  for i in "${!ips[@]}"; do
+    echo "$((i + 1))) ${ips[$i]}"
+  done
+
+  while true; do
+    read -rp "请输入编号（默认 1，输入 q 取消）: " ans
+    [[ -z "$ans" ]] && ans="1"
+    case "$ans" in
+      q|Q|0)
+        info "已取消，未写入任何配置。"
+        return 1
+        ;;
+    esac
+    if [[ "$ans" =~ ^[0-9]+$ ]] && (( ans >= 1 && ans <= ${#ips[@]} )); then
+      eval "$out_name=\"${ips[$((ans - 1))]}\""
+      return 0
+    fi
+    warn "编号无效，请重新输入。"
+  done
+}
+
+wait_for_domain_aaaa() {
+  local domain="$1"
+  local expected_ip="${2:-}"
+  local ans local_ips dns_ips
+
+  while true; do
+    if [[ -n "$expected_ip" ]]; then
+      domain_has_aaaa_ip "$domain" "$expected_ip" && break
+    else
+      domain_has_local_aaaa "$domain" && break
+    fi
+
+    local_ips="$(public_ipv6_addresses | paste -sd ' ' -)"
+    dns_ips="$(dns_aaaa_records "$domain" | paste -sd ' ' -)"
+
+    warn "未检测到 ${domain} 的 AAAA 记录指向本机 IPv6。"
+    if [[ -n "$expected_ip" ]]; then
+      note "请在 DNS 服务商添加/修改 AAAA 记录，指向："
+      echo "$expected_ip"
+    elif [[ -n "$local_ips" ]]; then
+      note "请在 DNS 服务商添加/修改 AAAA 记录，指向以下本机 IPv6："
+      echo "$local_ips" | tr ' ' '\n'
+    else
+      error "未检测到本机公网 IPv6 地址。"
+      return 1
+    fi
+    [[ -n "$dns_ips" ]] && warn "当前检测到的 AAAA：${dns_ips}"
+
+    read -rp "完成 DNS 解析后按回车重新检测，输入 q 取消返回: " ans
+    case "$ans" in
+      q|Q|0)
+        info "已取消，未写入任何配置。"
+        return 1
+        ;;
+    esac
+  done
+
+  info "AAAA 解析已指向本机 IPv6。"
+  return 0
+}
+
+nginx_listen_ipv4_line() {
+  local p="$1"
+  local flags="${2:-}"
+  local listen_mode="${3:-dual}"
+
+  [[ "$listen_mode" == "ipv6_only" ]] && return 0
+  if [[ -n "$flags" ]]; then
+    echo "    listen ${p} ${flags};"
+  else
+    echo "    listen ${p};"
+  fi
+}
+
 nginx_listen_ipv6_line() {
   # Print an additional IPv6 listen line for a given port, if IPv6 is available.
   # Usage: nginx_listen_ipv6_line 80 ""  -> "    listen [::]:80;"
@@ -716,6 +1095,65 @@ nginx_listen_ipv6_line() {
       echo "    listen [::]:${p};"
     fi
   fi
+}
+
+nginx_listen_ipv6_line_mode() {
+  local p="$1"
+  local flags="${2:-}"
+  local listen_mode="${3:-dual}"
+  local suffix=""
+
+  ipv6_available || return 0
+  [[ "$listen_mode" == "ipv6_only" ]] && suffix=" ipv6only=on"
+
+  if [[ -n "$flags" ]]; then
+    echo "    listen [::]:${p} ${flags}${suffix};"
+  else
+    echo "    listen [::]:${p}${suffix};"
+  fi
+}
+
+prepare_ipv6_only_https() {
+  local domain="$1"
+  local selected_ipv6
+
+  if valid_ipv4_host "$domain"; then
+    return 1
+  fi
+
+  if ! ipv6_available; then
+    warn "系统未启用 IPv6，无法自动使用 IPv6-only HTTPS。"
+    return 1
+  fi
+
+  if ! select_public_ipv6 selected_ipv6; then
+    warn "未检测到公网 IPv6 地址，无法自动使用 IPv6-only HTTPS。"
+    return 1
+  fi
+
+  if port_used_ipv6 443; then
+    warn "IPv6 的 443 端口也已被占用，无法自动使用 IPv6-only HTTPS。"
+    return 1
+  fi
+
+  note "检测到 IPv4 443 已占用，但 IPv6 443 可用，将尝试自动使用 IPv6-only HTTPS。"
+  note "选定 IPv6：${selected_ipv6}"
+
+  wait_for_domain_aaaa "$domain" "$selected_ipv6" || return 1
+
+  if [[ ! -f "${SSL_DIR}/${domain}/fullchain.pem" || ! -f "${SSL_DIR}/${domain}/privkey.pem" ]]; then
+    if ! ensure_email_interactive; then
+      warn "邮箱未设置成功，已取消 IPv6-only HTTPS 配置。"
+      return 1
+    fi
+
+    if ! issue_cert_for_domain "$domain" "ipv6_only"; then
+      warn "证书未申请成功，已取消 IPv6-only HTTPS 配置。"
+      return 1
+    fi
+  fi
+
+  return 0
 }
 
 url_scheme() {
@@ -851,20 +1289,24 @@ build_proxy_conf() {
   local listen_port="$2"
   local backend_port="$3"
   local out="$4"
+  local listen_mode="${5:-dual}"
 
   ensure_websocket_map
 
-  local ipv6_listen
-  ipv6_listen="$(nginx_listen_ipv6_line "$listen_port" "")"
+  local ipv4_listen ipv6_listen listen_mode_meta=""
+  ipv4_listen="$(nginx_listen_ipv4_line "$listen_port" "" "$listen_mode")"
+  ipv6_listen="$(nginx_listen_ipv6_line_mode "$listen_port" "" "$listen_mode")"
+  [[ "$listen_mode" != "dual" ]] && listen_mode_meta="# listen_mode=${listen_mode}"
 
   cat > "$out" <<EOF
 # managed_by=Nginx-X
 # domain=${domain}
 # listen_port=${listen_port}
+${listen_mode_meta}
 # backend_port=${backend_port}
 
 server {
-    listen ${listen_port};
+${ipv4_listen}
 ${ipv6_listen}
     server_name ${domain};
 
@@ -874,6 +1316,81 @@ ${ipv6_listen}
         default_type "text/plain";
         try_files \$uri =404;
     }
+
+    location / {
+        proxy_pass http://127.0.0.1:${backend_port};
+        proxy_http_version 1.1;
+
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_set_header X-Forwarded-Host \$host;
+        proxy_set_header X-Forwarded-Port \$server_port;
+
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection \$connection_upgrade;
+
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+    }
+}
+EOF
+}
+
+build_internal_https_conf() {
+  local domain="$1"
+  local https_port="$2"
+  local backend_port="$3"
+  local out="$4"
+  local listen_mode="${5:-dual}"
+
+  ensure_websocket_map
+
+  local redirect_suffix ipv4_listen_80 ipv6_listen_80 ipv4_listen_tls ipv6_listen_tls listen_mode_meta=""
+  if [[ "$https_port" == "443" ]]; then
+    redirect_suffix=""
+  else
+    redirect_suffix=":${https_port}"
+  fi
+
+  ipv4_listen_80="$(nginx_listen_ipv4_line 80 "" "$listen_mode")"
+  ipv6_listen_80="$(nginx_listen_ipv6_line_mode 80 "" "$listen_mode")"
+  ipv4_listen_tls="$(nginx_listen_ipv4_line "$https_port" "ssl http2" "$listen_mode")"
+  ipv6_listen_tls="$(nginx_listen_ipv6_line_mode "$https_port" "ssl http2" "$listen_mode")"
+  [[ "$listen_mode" != "dual" ]] && listen_mode_meta="# listen_mode=${listen_mode}"
+
+  cat > "$out" <<EOF
+# managed_by=Nginx-X
+# domain=${domain}
+# https_enabled=true
+# listen_port=${https_port}
+${listen_mode_meta}
+# backend_port=${backend_port}
+
+server {
+${ipv4_listen_80}
+${ipv6_listen_80}
+    server_name ${domain};
+
+    location ^~ /.well-known/acme-challenge/ {
+        root /usr/share/nginx/html;
+        default_type "text/plain";
+        try_files \$uri =404;
+    }
+
+    return 301 https://\$host${redirect_suffix}\$request_uri;
+}
+
+server {
+${ipv4_listen_tls}
+${ipv6_listen_tls}
+    server_name ${domain};
+
+    ssl_certificate     ${SSL_DIR}/${domain}/fullchain.pem;
+    ssl_certificate_key ${SSL_DIR}/${domain}/privkey.pem;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_prefer_server_ciphers off;
 
     location / {
         proxy_pass http://127.0.0.1:${backend_port};
@@ -909,6 +1426,7 @@ build_external_proxy_conf() {
 
   ensure_websocket_map
   local stream_upstream_urls="${10:-}"
+  local listen_mode="${11:-dual}"
   local main_stream_block=""
   local stream_location_block=""
   local lily_block=""
@@ -917,7 +1435,7 @@ build_external_proxy_conf() {
   local main_header_block=""
   local stream_sni_block=""
   local redirect_suffix=""
-  local upstream_host https_meta https_cert_block
+  local upstream_host https_meta https_cert_block listen_mode_meta=""
   local -a stream_urls=()
   local idx stream_url stream_path stream_host_line stream_redirect_block=""
   local stream_lily_block="" base_lily_block=""
@@ -941,6 +1459,7 @@ build_external_proxy_conf() {
 
   https_meta=""
   https_cert_block=""
+  [[ "$listen_mode" != "dual" ]] && listen_mode_meta="# listen_mode=${listen_mode}"
   if [[ "$https_enabled" == "1" ]]; then
     https_meta="# https_enabled=true"
     https_cert_block=$(cat <<EOF
@@ -1087,9 +1606,11 @@ ${main_header_block}"
   fi
 
   if [[ "$https_enabled" == "1" ]]; then
-    local ipv6_listen_80 ipv6_listen_tls
-    ipv6_listen_80="$(nginx_listen_ipv6_line 80 "")"
-    ipv6_listen_tls="$(nginx_listen_ipv6_line "$listen_port" "ssl http2")"
+    local ipv4_listen_80 ipv6_listen_80 ipv4_listen_tls ipv6_listen_tls
+    ipv4_listen_80="$(nginx_listen_ipv4_line 80 "" "$listen_mode")"
+    ipv6_listen_80="$(nginx_listen_ipv6_line_mode 80 "" "$listen_mode")"
+    ipv4_listen_tls="$(nginx_listen_ipv4_line "$listen_port" "ssl http2" "$listen_mode")"
+    ipv6_listen_tls="$(nginx_listen_ipv6_line_mode "$listen_port" "ssl http2" "$listen_mode")"
 
     cat > "$out" <<EOF
 # managed_by=Nginx-X
@@ -1097,6 +1618,7 @@ ${main_header_block}"
 # external_mode=${external_mode}
 # domain=${domain}
 # listen_port=${listen_port}
+${listen_mode_meta}
 ${https_meta}
 # upstream_url=${upstream_url}
 # stream_upstream_url=${stream_upstream_url}
@@ -1105,7 +1627,7 @@ ${https_meta}
 # referer_url=${referer_url}
 
 server {
-    listen 80;
+${ipv4_listen_80}
 ${ipv6_listen_80}
     server_name ${domain};
 
@@ -1119,7 +1641,7 @@ ${ipv6_listen_80}
 }
 
 server {
-    listen ${listen_port} ssl http2;
+${ipv4_listen_tls}
 ${ipv6_listen_tls}
     server_name ${domain};
 
@@ -1142,8 +1664,9 @@ ${stream_location_block}
 }
 EOF
   else
-    local ipv6_listen_plain
-    ipv6_listen_plain="$(nginx_listen_ipv6_line "$listen_port" "")"
+    local ipv4_listen_plain ipv6_listen_plain
+    ipv4_listen_plain="$(nginx_listen_ipv4_line "$listen_port" "" "$listen_mode")"
+    ipv6_listen_plain="$(nginx_listen_ipv6_line_mode "$listen_port" "" "$listen_mode")"
 
     cat > "$out" <<EOF
 # managed_by=Nginx-X
@@ -1151,6 +1674,7 @@ EOF
 # external_mode=${external_mode}
 # domain=${domain}
 # listen_port=${listen_port}
+${listen_mode_meta}
 # upstream_url=${upstream_url}
 # stream_upstream_url=${stream_upstream_url}
 # stream_upstream_urls=${stream_upstream_urls}
@@ -1158,7 +1682,7 @@ EOF
 # referer_url=${referer_url}
 
 server {
-    listen ${listen_port};
+${ipv4_listen_plain}
 ${ipv6_listen_plain}
     server_name ${domain};
 
@@ -1230,6 +1754,7 @@ apply_conf_with_rollback() {
 
   if test_output="$(${SUDO} nginx -t 2>&1)"; then
     reload_nginx_safe
+    ensure_firewall_for_conf "$target_conf"
     [[ -f "$backup" ]] && ${SUDO} rm -f "$backup"
     return 0
   fi
@@ -1249,6 +1774,7 @@ apply_conf_with_rollback() {
 add_reverse_proxy() {
   local domain listen_port backend_port target tmp
   local desired_port create_port force_enable_https="0"
+  local listen_mode="dual"
 
   require_nginx_installed || return 1
 
@@ -1275,6 +1801,23 @@ add_reverse_proxy() {
 
   if is_port_used_os "$listen_port"; then
     warn "监听端口 ${listen_port} 当前已被占用（Nginx 多站点场景通常可复用）。"
+    if [[ "$listen_port" == "443" ]] && ! port_has_ssl_listener "$listen_port"; then
+      if prepare_ipv6_only_https "$domain"; then
+        listen_mode="ipv6_only"
+        target="$(conf_target_path "$domain" "$listen_port")"
+        tmp="$(mktemp /tmp/nginxx-"${domain}".XXXXXX.conf)"
+        trap 'rm -f "${tmp:-}"' RETURN
+        build_internal_https_conf "$domain" "$listen_port" "$backend_port" "$tmp" "$listen_mode"
+        if apply_conf_with_rollback "$tmp" "$target"; then
+          info "已完成：IPv6-only 反向代理 + HTTPS 配置。"
+        fi
+        rm -f "$tmp"
+        return 0
+      fi
+      info "已取消添加配置。"
+      return 0
+    fi
+
     if ! confirm "是否继续写入配置并交由 nginx -t 校验？"; then
       info "已取消添加配置。"
       return 0
@@ -1361,6 +1904,7 @@ add_external_url_proxy() {
   local domain listen_port upstream_url target tmp external_mode
   local stream_upstream_url="" stream_upstream_urls="" source_site_url="" referer_url=""
   local desired_port create_port force_enable_https="0"
+  local listen_mode="dual"
 
   require_nginx_installed || return 1
 
@@ -1410,6 +1954,23 @@ add_external_url_proxy() {
 
   if is_port_used_os "$listen_port"; then
     warn "监听端口 ${listen_port} 当前已被占用（Nginx 多站点场景通常可复用）。"
+    if [[ "$listen_port" == "443" ]] && ! port_has_ssl_listener "$listen_port"; then
+      if prepare_ipv6_only_https "$domain"; then
+        listen_mode="ipv6_only"
+        target="$(conf_target_path "$domain" "$listen_port")"
+        tmp="$(mktemp /tmp/nginxx-external-"${domain}".XXXXXX.conf)"
+        trap 'rm -f "${tmp:-}"' RETURN
+        build_external_proxy_conf "$domain" "$listen_port" "$upstream_url" "$external_mode" "$tmp" "1" "$stream_upstream_url" "$source_site_url" "$referer_url" "$stream_upstream_urls" "$listen_mode"
+        if apply_conf_with_rollback "$tmp" "$target"; then
+          info "已完成：IPv6-only 外部反代 + HTTPS 配置。"
+        fi
+        rm -f "$tmp"
+        return 0
+      fi
+      info "已取消添加配置。"
+      return 0
+    fi
+
     if ! confirm "是否继续写入配置并交由 nginx -t 校验？"; then
       info "已取消添加配置。"
       return 0
@@ -1565,6 +2126,7 @@ enable_conf() {
 
   if nginx_test; then
     reload_nginx_safe
+    ensure_firewall_port_open "$(conf_meta_get "$dst" listen_port)"
     info "已启用：$(basename "$dst")"
   else
     ${SUDO} mv "$dst" "$src"
@@ -1575,7 +2137,7 @@ enable_conf() {
 }
 
 disable_conf() {
-  local file src dst
+  local file src dst old_ports
   file="${1:-}"
   if [[ -z "$file" ]]; then
     error "未指定配置文件。"
@@ -1588,11 +2150,13 @@ disable_conf() {
     return 0
   fi
 
+  old_ports="$(conf_listen_ports "$src")"
   dst="${src}.bak"
   ${SUDO} mv "$src" "$dst"
 
   if nginx_test; then
     reload_nginx_safe
+    release_firewall_for_ports_if_unused "$old_ports"
     info "已停用：$(basename "$dst")"
   else
     ${SUDO} mv "$dst" "$src"
@@ -1922,13 +2486,15 @@ delete_conf() {
   fi
 
   # 先删，再校验，失败则无法自动恢复（所以先备份）
-  local backup
+  local backup old_ports
   backup="${target}.delbak.$(date +%s)"
+  old_ports="$(conf_listen_ports "$target")"
   ${SUDO} cp -a "$target" "$backup"
   ${SUDO} rm -f "$target"
 
   if nginx_test; then
     reload_nginx_safe
+    release_firewall_for_ports_if_unused "$old_ports"
     ${SUDO} rm -f "$backup"
     info "已删除：${file}"
   else
@@ -2531,6 +3097,7 @@ ensure_acme_location_for_domain_conf() {
 ensure_http_challenge_server() {
   # 为“非80端口业务配置”补一个临时 80 验证入口，保证 HTTP-01 可达
   local domain="$1"
+  local listen_mode="${2:-dual}"
   local challenge_conf="${CONF_DIR}/acme-challenge-${domain}.conf"
 
   # 检测是否已存在“同域名 + 80监听”的配置
@@ -2548,14 +3115,15 @@ ensure_http_challenge_server() {
     return 0
   fi
 
-  local tmp_challenge ipv6_listen
+  local tmp_challenge ipv4_listen ipv6_listen
   tmp_challenge="$(mktemp /tmp/.acme-challenge-"${domain}".XXXXXX.conf)"
-  ipv6_listen="$(nginx_listen_ipv6_line 80 "")"
+  ipv4_listen="$(nginx_listen_ipv4_line 80 "" "$listen_mode")"
+  ipv6_listen="$(nginx_listen_ipv6_line_mode 80 "" "$listen_mode")"
   trap 'rm -f "${tmp_challenge:-}"' RETURN
 
   cat > "$tmp_challenge" <<EOF
 server {
-    listen 80;
+${ipv4_listen}
 ${ipv6_listen}
     server_name ${domain};
 
@@ -2586,6 +3154,7 @@ precheck_http01() {
   # 证书申请前自检：DNS、80监听、challenge本地命中、域名回环可达
   # 返回码：0=通过，10=软失败(可继续)，11=硬失败(不建议继续)
   local domain="$1"
+  local listen_mode="${2:-dual}"
   local token file_path local_url domain_url local_body domain_body
 
   note "开始执行 HTTP-01 申请前自检..."
@@ -2600,9 +3169,16 @@ precheck_http01() {
   info "DNS解析：${dns_out}"
 
   # 2) 本机80监听检查
-  if ! ss -lnt | awk 'NR>1{print $4}' | grep -qE '(^|:)80$'; then
-    error "自检失败：本机未监听 80 端口。"
-    return 11
+  if [[ "$listen_mode" == "ipv6_only" ]]; then
+    if ! port_used_ipv6 80; then
+      error "自检失败：本机 IPv6 未监听 80 端口。"
+      return 11
+    fi
+  else
+    if ! ss -lnt | awk 'NR>1{print $4}' | grep -qE '(^|:)80$'; then
+      error "自检失败：本机未监听 80 端口。"
+      return 11
+    fi
   fi
 
   # 3) challenge 文件本地命中检查
@@ -2611,8 +3187,13 @@ precheck_http01() {
   ${SUDO} mkdir -p "$(dirname "$file_path")"
   echo "$token" | ${SUDO} tee "$file_path" >/dev/null
 
-  local_url="http://127.0.0.1/.well-known/acme-challenge/${token}"
-  local_body="$(curl -fsS --max-time 8 -H "Host: ${domain}" "$local_url" 2>/dev/null || true)"
+  if [[ "$listen_mode" == "ipv6_only" ]]; then
+    local_url="http://[::1]/.well-known/acme-challenge/${token}"
+    local_body="$(curl -g -6 -fsS --max-time 8 -H "Host: ${domain}" "$local_url" 2>/dev/null || true)"
+  else
+    local_url="http://127.0.0.1/.well-known/acme-challenge/${token}"
+    local_body="$(curl -fsS --max-time 8 -H "Host: ${domain}" "$local_url" 2>/dev/null || true)"
+  fi
   if [[ "$local_body" != "$token" ]]; then
     ${SUDO} rm -f "$file_path" 2>/dev/null || true
     error "自检失败：本机 challenge 路径未命中（${local_url}，Host: ${domain}）。"
@@ -2621,7 +3202,11 @@ precheck_http01() {
 
   # 4) 域名回环可达检查（模拟 CA 通过域名访问 80）
   domain_url="http://${domain}/.well-known/acme-challenge/${token}"
-  domain_body="$(curl -fsS --max-time 10 "$domain_url" 2>/dev/null || true)"
+  if [[ "$listen_mode" == "ipv6_only" ]]; then
+    domain_body="$(curl -6 -fsS --max-time 10 "$domain_url" 2>/dev/null || true)"
+  else
+    domain_body="$(curl -fsS --max-time 10 "$domain_url" 2>/dev/null || true)"
+  fi
   ${SUDO} rm -f "$file_path" 2>/dev/null || true
 
   if [[ "$domain_body" != "$token" ]]; then
@@ -2656,6 +3241,7 @@ issue_cert() {
 issue_cert_for_domain() {
   # 参数：域名；用于"添加反向代理后自动申请证书"场景
   local domain="$1"
+  local listen_mode="${2:-dual}"
   load_email
 
   if [[ -z "${ACME_EMAIL:-}" ]]; then
@@ -2663,16 +3249,17 @@ issue_cert_for_domain() {
     return 1
   fi
 
-  _issue_cert_impl "$domain"
+  _issue_cert_impl "$domain" "$listen_mode"
 }
 
 _issue_cert_impl() {
   # 内部共享实现：签发证书（被 issue_cert 和 issue_cert_for_domain 调用）
   local domain="$1"
+  local listen_mode="${2:-dual}"
   local challenge_conf
 
   ensure_acme_location_for_domain_conf "$domain"
-  challenge_conf="$(ensure_http_challenge_server "$domain")"
+  challenge_conf="$(ensure_http_challenge_server "$domain" "$listen_mode")"
 
   # 确保挑战配置已生效
   if ! reload_nginx_safe; then
@@ -2682,7 +3269,7 @@ _issue_cert_impl() {
   fi
 
   local pre_rc=0
-  if precheck_http01 "$domain"; then
+  if precheck_http01 "$domain" "$listen_mode"; then
     pre_rc=0
   else
     pre_rc=$?
@@ -3154,7 +3741,7 @@ disable_https_for_conf_file() {
   local conf_file="$2"
   local mode external_mode upstream_url stream_upstream_url source_site_url referer_url
   local stream_upstream_urls
-  local listen_port existing_upstream host_header ssl_sni_line stream_mode stream_block tmp
+  local listen_port existing_upstream host_header ssl_sni_line stream_mode stream_block tmp listen_mode
 
   ensure_websocket_map
 
@@ -3164,6 +3751,8 @@ disable_https_for_conf_file() {
   if [[ "$mode" == "external" ]]; then
     listen_port="$(conf_meta_get "$conf_file" listen_port)"
     [[ -z "$listen_port" ]] && listen_port="80"
+    listen_mode="$(conf_meta_get "$conf_file" listen_mode)"
+    [[ -z "$listen_mode" ]] && listen_mode="dual"
     external_mode="$(conf_meta_get "$conf_file" external_mode)"
     upstream_url="$(conf_meta_get "$conf_file" upstream_url)"
     stream_upstream_url="$(conf_meta_get "$conf_file" stream_upstream_url)"
@@ -3174,7 +3763,7 @@ disable_https_for_conf_file() {
 
     tmp="$(mktemp /tmp/nginxx-disable-https-"${domain}".XXXXXX.conf)"
     trap 'rm -f "${tmp:-}"' RETURN
-    build_external_proxy_conf "$domain" "$listen_port" "$upstream_url" "$external_mode" "$tmp" "0" "$stream_upstream_url" "$source_site_url" "$referer_url" "$stream_upstream_urls"
+    build_external_proxy_conf "$domain" "$listen_port" "$upstream_url" "$external_mode" "$tmp" "0" "$stream_upstream_url" "$source_site_url" "$referer_url" "$stream_upstream_urls" "$listen_mode"
     if apply_conf_with_rollback "$tmp" "$conf_file"; then
       info "HTTPS 已停用：$(basename "$conf_file")"
       rm -f "$tmp"
@@ -3187,6 +3776,8 @@ disable_https_for_conf_file() {
 
   listen_port="$(conf_meta_get "$conf_file" listen_port)"
   [[ -z "$listen_port" ]] && listen_port="80"
+  listen_mode="$(conf_meta_get "$conf_file" listen_mode)"
+  [[ -z "$listen_mode" ]] && listen_mode="dual"
 
   stream_mode="$(conf_meta_get "$conf_file" stream_mode)"
   stream_block=""
@@ -3225,10 +3816,12 @@ BLOCK
 # managed_by=Nginx-X
 # domain=${domain}
 # listen_port=${listen_port}
+$( [[ "$listen_mode" != "dual" ]] && echo "# listen_mode=${listen_mode}" )
 # stream_mode=${stream_mode:-normal}
 
 server {
-    listen ${listen_port};
+$(nginx_listen_ipv4_line "$listen_port" "" "$listen_mode")
+$(nginx_listen_ipv6_line_mode "$listen_port" "" "$listen_mode")
     server_name ${domain};
 
     # ACME HTTP-01 验证路径（证书申请/续期）
@@ -3378,7 +3971,7 @@ enable_https_for_conf_file() {
   local conf_file="$2"
   local force_port="${3:-}"
   local mode external_mode upstream_url stream_upstream_url stream_upstream_urls source_site_url referer_url
-  local tmp listen_port redirect_suffix stream_mode stream_block effective_https_port
+  local tmp listen_port effective_https_port listen_mode
 
   ensure_websocket_map
 
@@ -3398,6 +3991,8 @@ enable_https_for_conf_file() {
   listen_port="$(conf_meta_get "$conf_file" listen_port)"
   [[ -n "$force_port" ]] && listen_port="$force_port"
   [[ -z "$listen_port" ]] && listen_port="443"
+  listen_mode="$(conf_meta_get "$conf_file" listen_mode)"
+  [[ -z "$listen_mode" ]] && listen_mode="dual"
 
   effective_https_port="$listen_port"
   if [[ "$effective_https_port" == "80" ]]; then
@@ -3416,7 +4011,7 @@ enable_https_for_conf_file() {
 
     tmp="$(mktemp /tmp/nginxx-https-"${domain}".XXXXXX.conf)"
     trap 'rm -f "${tmp:-}"' RETURN
-    build_external_proxy_conf "$domain" "$effective_https_port" "$upstream_url" "$external_mode" "$tmp" "1" "$stream_upstream_url" "$source_site_url" "$referer_url" "$stream_upstream_urls"
+    build_external_proxy_conf "$domain" "$effective_https_port" "$upstream_url" "$external_mode" "$tmp" "1" "$stream_upstream_url" "$source_site_url" "$referer_url" "$stream_upstream_urls" "$listen_mode"
     if apply_conf_with_rollback "$tmp" "$conf_file"; then
       info "HTTPS 已启用，且已配置 80 -> ${effective_https_port} 强制跳转。"
       rm -f "$tmp"
@@ -3427,119 +4022,23 @@ enable_https_for_conf_file() {
     return 1
   fi
 
-  if [[ "$effective_https_port" == "443" ]]; then
-    redirect_suffix=""
-  else
-    redirect_suffix=":${effective_https_port}"
-  fi
-
-  stream_mode="$(conf_meta_get "$conf_file" stream_mode)"
-  stream_block=""
-  if [[ "$stream_mode" == "media" ]]; then
-    stream_block=$(cat <<'BLOCK'
-        # Stream 转发优化（Emby/Jellyfin 等）
-        proxy_request_buffering off;
-        proxy_buffering off;
-        proxy_max_temp_file_size 0;
-        send_timeout 3600s;
-        client_max_body_size 0;
-BLOCK
-)
-  fi
-
   tmp="$(mktemp /tmp/nginxx-https-"${domain}".XXXXXX.conf)"
   trap 'rm -f "${tmp:-}"' RETURN
 
   # 复用原配置上游：优先读取注释元数据，避免同端口多域名场景误取到错误上游
-  local existing_upstream host_header ssl_sni_line backend_port_meta upstream_url_meta
-  upstream_url_meta="$(conf_meta_get "$conf_file" upstream_url)"
+  local backend_port_meta upstream_url_meta
   backend_port_meta="$(conf_meta_get "$conf_file" backend_port)"
+  upstream_url_meta="$(conf_meta_get "$conf_file" upstream_url)"
 
   if [[ -n "$upstream_url_meta" ]]; then
-    existing_upstream="$upstream_url_meta"
+    build_external_proxy_conf "$domain" "$effective_https_port" "$upstream_url_meta" "normal" "$tmp" "1" "" "" "" "" "$listen_mode"
   elif [[ -n "$backend_port_meta" ]]; then
-    existing_upstream="http://127.0.0.1:${backend_port_meta}"
+    build_internal_https_conf "$domain" "$effective_https_port" "$backend_port_meta" "$tmp" "$listen_mode"
   else
-    existing_upstream="$(grep -Eo 'proxy_pass [^;]+' "$conf_file" | head -n1 | sed 's/^proxy_pass //')"
+    backend_port_meta="$(sed -nE 's/.*proxy_pass[[:space:]]+https?:\/\/127\.0\.0\.1:([0-9]+).*/\1/p' "$conf_file" 2>/dev/null | head -1 || true)"
+    [[ -z "$backend_port_meta" ]] && backend_port_meta="3000"
+    build_internal_https_conf "$domain" "$effective_https_port" "$backend_port_meta" "$tmp" "$listen_mode"
   fi
-
-  [[ -z "$existing_upstream" ]] && existing_upstream="http://127.0.0.1:3000"
-
-  # 外部上游（尤其 https）需要 SNI 与上游 Host，避免 502/握手失败
-  if [[ "$existing_upstream" =~ ^https?://127\.0\.0\.1(:[0-9]+)?(/|$) ]]; then
-    # shellcheck disable=SC2016
-    host_header='$host'
-    ssl_sni_line=''
-  else
-    # shellcheck disable=SC2016
-    host_header='$proxy_host'
-    if [[ "$existing_upstream" =~ ^https:// ]]; then
-      ssl_sni_line='        proxy_ssl_server_name on;'
-    else
-      ssl_sni_line=''
-    fi
-  fi
-
-  # 生成 HTTPS 配置：若原配置监听 80，则自动切到标准 443，避免 80 同时承担重定向与 SSL 监听
-  local ipv6_listen_80 ipv6_listen_tls
-  ipv6_listen_80="$(nginx_listen_ipv6_line 80 "")"
-  ipv6_listen_tls="$(nginx_listen_ipv6_line "$effective_https_port" "ssl http2")"
-
-  cat > "$tmp" <<EOF
-# managed_by=Nginx-X
-# domain=${domain}
-# https_enabled=true
-# listen_port=${effective_https_port}
-# stream_mode=${stream_mode:-normal}
-
-server {
-    listen 80;
-${ipv6_listen_80}
-    server_name ${domain};
-
-    # 保留 ACME 验证路径，避免被 301 跳转影响签发/续期
-    location ^~ /.well-known/acme-challenge/ {
-        root /usr/share/nginx/html;
-        default_type "text/plain";
-        try_files \$uri =404;
-    }
-
-    return 301 https://\$host${redirect_suffix}\$request_uri;
-}
-
-server {
-    listen ${effective_https_port} ssl http2;
-${ipv6_listen_tls}
-    server_name ${domain};
-
-    ssl_certificate     ${SSL_DIR}/${domain}/fullchain.pem;
-    ssl_certificate_key ${SSL_DIR}/${domain}/privkey.pem;
-    ssl_protocols TLSv1.2 TLSv1.3;
-    ssl_prefer_server_ciphers off;
-
-    location / {
-        proxy_pass ${existing_upstream};
-        proxy_http_version 1.1;
-
-${stream_block}
-
-${ssl_sni_line}
-
-        proxy_set_header Host ${host_header};
-        proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto \$scheme;
-        proxy_set_header X-Forwarded-Host \$host;
-        proxy_set_header X-Forwarded-Port \$server_port;
-
-        proxy_set_header Upgrade \$http_upgrade;
-        proxy_set_header Connection \$connection_upgrade;
-
-        proxy_read_timeout 3600s;
-        proxy_send_timeout 3600s;
-    }
-}
-EOF
 
   if apply_conf_with_rollback "$tmp" "$conf_file"; then
     info "HTTPS 已启用，且已配置 80 -> ${effective_https_port} 强制跳转。"
@@ -3840,7 +4339,8 @@ uninstall_script_only() {
     warn "未发现 /usr/local/bin/nx，跳过。"
   fi
 
-  # 2) 清理脚本目录下运行状态文件
+  # 2) 回滚脚本自动开放的防火墙规则，并清理运行状态文件
+  release_all_owned_firewall_rules
   rm -f "$EMAIL_CONF" 2>/dev/null || true
 
   # 3) 给出手动删除路径（仅当不在系统通用 bin 目录），避免误导用户去清理 /usr/local/bin
@@ -3878,6 +4378,8 @@ uninstall_nginx_only() {
     ${SUDO} systemctl stop nginx 2>/dev/null || true
     ${SUDO} systemctl disable nginx 2>/dev/null || true
   fi
+
+  release_all_owned_firewall_rules
 
   case "$pkg" in
     apt)

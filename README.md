@@ -45,6 +45,8 @@ bash install.sh
 - **CentOS 7 / 老 Bash 兼容**：替换依赖 Bash 新特性的数组读取写法，避免老系统中 `mapfile`、nameref 等兼容问题。
 - **Nginx 升级提示增强**：当无法访问或解析 nginx.org 最新版本时，提示更明确，并回退到包管理器升级检查。
 - **ACME / IPv6 增强**：HTTP-01 临时验证入口在系统 IPv6 可用时会同时监听 `80` 和 `[::]:80`，降低有 AAAA 记录时证书验证失败的概率。
+- **IPv6-only HTTPS 自动适配**：当用户选择 `443`，但 IPv4 `443` 已被其他服务占用时，脚本会自动检测 IPv6、AAAA 解析和证书条件，条件满足后只监听 `[::]:443 ipv6only=on`。
+- **端口自动放行与回滚**：配置成功落地后会尝试自动开放对应端口；CentOS 7/firewalld 环境优先使用 `systemctl` 启动 `firewalld`，再用 `firewall-cmd` 放行。脚本只记录并回滚自己新增的防火墙规则，不关闭用户原本已开放的端口。
 - **保留上游修复**：已融合上游导入配置失败自动回滚的修复，避免导入失败后留下半成品配置。
 
 如果你想使用本 fork 的兼容版，请使用本文档里的 `youshang8520/Nginx-X` 安装命令，不要使用上游 `Xiuyixx/Nginx-X` 的 raw 安装地址。
@@ -102,6 +104,7 @@ bash install.sh
   - `listen [::]:80;`
   - `listen [::]:443 ssl;`（或对应的 HTTPS 监听端口）
 - **ACME HTTP-01 验证**：临时验证入口在 IPv6 可用时也会写入 `listen [::]:80;`，适配有 AAAA 记录的域名。
+- **IPv6-only HTTPS**：如果 IPv4 `443` 已被其他服务占用，而 IPv6 `443` 可用，脚本会自动引导使用 IPv6-only HTTPS，不需要用户手动编辑 Nginx 配置。
 - **上游反代到 IPv6**：支持上游 URL 使用 IPv6（需要按 URL 规范使用方括号），例如：
   - `http://[2001:db8::1]:8080`
   - `https://[2400:3200::1]`
@@ -153,6 +156,16 @@ bash install.sh
 
    在“配置管理”里选择“添加配置”或“外部反代”。脚本检测到 IPv6 可用时，会自动生成 IPv6 监听行。
 
+   如果你选择监听 `443`，但 IPv4 的 `443` 已经被其他服务占用，脚本会自动尝试 IPv6-only HTTPS：
+
+   - 检测系统 IPv6 是否可用
+   - 检测 IPv6 `443` 是否空闲
+   - 如果有多个公网 IPv6，列出地址并让用户选择，默认使用第一个
+   - 检查域名 AAAA 是否指向选中的 IPv6
+   - 如果未解析，会显示需要添加的 IPv6 地址，用户添加后按回车重新检测
+   - 证书申请成功、Nginx 校验通过后才落地最终配置
+   - 任一步失败或用户取消，都不会写入半成品站点配置
+
 6. 申请证书前做外部连通性检查：
 
    ```bash
@@ -175,6 +188,8 @@ bash install.sh
 - Nginx 配置里没有 `[::]` 监听：通常是系统禁用了 IPv6，检查 `sysctl net.ipv6.conf.all.disable_ipv6`。
 - 后端是 IPv6 地址：上游 URL 必须使用方括号，例如 `http://[2400:3200::1]:8096`。
 - 使用 CDN 时：确认 CDN 的 IPv6 回源、HTTP-01 路径和 80 端口策略没有拦截。
+- 如果服务器有多个 IPv6：脚本会列出地址，默认选第一个，也可以输入编号指定某个 IPv6；域名 AAAA 必须解析到选中的地址。
+- 如果系统使用 firewalld：脚本会优先用 `systemctl enable --now firewalld` 启动服务，再用 `firewall-cmd --permanent --add-service=http/https` 或 `--add-port=端口/tcp` 放行。
 
 3. **证书管理**
    - 设置邮箱（持久化到 `${XDG_CONFIG_HOME:-$HOME/.config}/nginxx/email.conf`）

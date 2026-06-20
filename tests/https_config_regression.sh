@@ -24,7 +24,11 @@ case "$1" in
   *) exit 0 ;;
 esac
 EOF
-chmod +x "$MOCK_BIN/nginx" "$MOCK_BIN/systemctl"
+cat > "$MOCK_BIN/firewall-cmd" <<'EOF'
+#!/usr/bin/env bash
+exit 1
+EOF
+chmod +x "$MOCK_BIN/nginx" "$MOCK_BIN/systemctl" "$MOCK_BIN/firewall-cmd"
 export PATH="$MOCK_BIN:$PATH"
 
 # shellcheck disable=SC1091,SC1090
@@ -63,6 +67,26 @@ fi
 grep -Fq 'return 301 https://$host$request_uri;' "$out"
 grep -q "ssl_certificate     ${SSL_DIR}/example.com/fullchain.pem;" "$out"
 grep -q "ssl_certificate_key ${SSL_DIR}/example.com/privkey.pem;" "$out"
+
+ipv6_only_conf="$TMPDIR_ROOT/ipv6-only-443.conf"
+build_internal_https_conf \
+  "ipv6-only.example.com" \
+  "443" \
+  "3000" \
+  "$ipv6_only_conf" \
+  "ipv6_only"
+
+grep -q '^# listen_mode=ipv6_only$' "$ipv6_only_conf"
+grep -q 'listen \[::\]:443 ssl http2 ipv6only=on;' "$ipv6_only_conf"
+grep -q 'listen \[::\]:80 ipv6only=on;' "$ipv6_only_conf"
+if grep -q 'listen 443 ssl' "$ipv6_only_conf"; then
+  echo "ipv6-only config should not listen on IPv4 443" >&2
+  exit 1
+fi
+if grep -q 'listen 80;' "$ipv6_only_conf"; then
+  echo "ipv6-only config should not listen on IPv4 80" >&2
+  exit 1
+fi
 
 # Internal helper configs should not appear in the user-managed site list,
 # including disabled/backup variants.
