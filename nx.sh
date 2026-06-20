@@ -3100,21 +3100,6 @@ ensure_http_challenge_server() {
   local listen_mode="${2:-dual}"
   local challenge_conf="${CONF_DIR}/acme-challenge-${domain}.conf"
 
-  # 检测是否已存在“同域名 + 80监听”的配置
-  if awk -v d="$domain" '
-    BEGIN{in_server=0; has80=0; hasDomain=0}
-    /server\s*\{/ {in_server=1; has80=0; hasDomain=0}
-    in_server && /listen[[:space:]]+80([[:space:]]|;)/ {has80=1}
-    in_server && index($0, "server_name") && index($0, d) {hasDomain=1}
-    in_server && /}/ {
-      if (has80 && hasDomain) {print "yes"; exit 0}
-      in_server=0
-    }
-  ' "${CONF_DIR}"/*.conf 2>/dev/null | grep -q yes; then
-    echo ""
-    return 0
-  fi
-
   local tmp_challenge ipv4_listen ipv6_listen
   tmp_challenge="$(mktemp /tmp/.acme-challenge-"${domain}".XXXXXX.conf)"
   ipv4_listen="$(nginx_listen_ipv4_line 80 "" "$listen_mode")"
@@ -3267,6 +3252,7 @@ _issue_cert_impl() {
     error "证书申请前校验失败：Nginx 配置未生效。"
     return 1
   fi
+  ensure_firewall_port_open 80
 
   local pre_rc=0
   if precheck_http01 "$domain" "$listen_mode"; then
@@ -3276,21 +3262,15 @@ _issue_cert_impl() {
   fi
   if (( pre_rc != 0 )); then
     if [[ $pre_rc -eq 10 ]]; then
-      if ! confirm "自检存在风险，是否仍继续申请证书？"; then
-        cleanup_http_challenge_server "$challenge_conf"
-        reload_nginx_safe || true
-        info "已取消申请。"
-        return 1
-      fi
-      warn "你选择继续申请，将直接尝试签发。"
+      cleanup_http_challenge_server "$challenge_conf"
+      reload_nginx_safe || true
+      error "HTTP-01 自检未通过，已取消证书申请，避免继续触发 CA 验证失败。"
+      return 1
     else
-      if ! confirm "自检失败（建议先修复），是否仍强制继续申请？"; then
-        cleanup_http_challenge_server "$challenge_conf"
-        reload_nginx_safe || true
-        info "已取消申请。"
-        return 1
-      fi
-      warn "你选择强制继续申请。"
+      cleanup_http_challenge_server "$challenge_conf"
+      reload_nginx_safe || true
+      error "HTTP-01 自检失败，已取消证书申请。请先修复 80 端口监听、DNS 或防火墙。"
+      return 1
     fi
   fi
 
