@@ -2548,13 +2548,15 @@ ensure_http_challenge_server() {
     return 0
   fi
 
-  local tmp_challenge
+  local tmp_challenge ipv6_listen
   tmp_challenge="$(mktemp /tmp/.acme-challenge-"${domain}".XXXXXX.conf)"
+  ipv6_listen="$(nginx_listen_ipv6_line 80 "")"
   trap 'rm -f "${tmp_challenge:-}"' RETURN
 
   cat > "$tmp_challenge" <<EOF
 server {
     listen 80;
+${ipv6_listen}
     server_name ${domain};
 
     location ^~ /.well-known/acme-challenge/ {
