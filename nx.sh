@@ -305,6 +305,18 @@ enabled_configs_using_port() {
   grep -R -l -E "listen[[:space:]]+(\\[::\\]:)?${port}([[:space:]]|;)" "${CONF_DIR}"/*.conf 2>/dev/null || true
 }
 
+print_port_troubleshooting_commands() {
+  local domain="${1:-你的域名}"
+  local https_port="${2:-443}"
+
+  warn "常用排查命令："
+  warn "  ss -lntp '( sport = :80 )' && ss -lntp6 '( sport = :80 )'"
+  warn "  ss -lntp '( sport = :${https_port} )' && ss -lntp6 '( sport = :${https_port} )'"
+  warn "  firewall-cmd --get-active-zones && firewall-cmd --list-all"
+  warn "  grep -R -n \"listen .*80\\|server_name ${domain}\" /etc/nginx/"
+  warn "  curl -4 -I http://${domain}/ && curl -6 -I http://${domain}/"
+}
+
 conf_listen_ports() {
   local conf_file="$1"
   grep -E '^[[:space:]]*listen[[:space:]]+' "$conf_file" 2>/dev/null \
@@ -326,6 +338,7 @@ ensure_firewall_port_open() {
 
   if [[ "$backend" == "none" ]]; then
     warn "未检测到已启用的 firewalld/ufw，无法自动放行端口 ${port}。请确认云安全组和系统防火墙已放行。"
+    warn "排查命令：firewall-cmd --get-active-zones && firewall-cmd --list-all"
     return 0
   fi
 
@@ -338,6 +351,7 @@ ensure_firewall_port_open() {
     info "已自动开放端口 ${port}（${backend}）。"
   else
     warn "自动开放端口 ${port} 失败，请手动检查防火墙。"
+    warn "排查命令：firewall-cmd --get-active-zones && firewall-cmd --list-all"
   fi
 }
 
@@ -1892,6 +1906,7 @@ add_reverse_proxy() {
             fi
           else
             warn "自动证书申请失败，当前仅保留 HTTP 反向代理配置。通常是域名未解析到本机、80 端口未放行，或 CDN/防火墙拦截导致。"
+            print_port_troubleshooting_commands "$domain" "$desired_port"
           fi
         fi
       fi
@@ -2041,6 +2056,7 @@ add_external_url_proxy() {
             fi
           else
             warn "自动证书申请失败，当前仅保留 HTTP 反代配置。通常是域名未解析到本机、80 端口未放行，或 CDN/防火墙拦截导致。"
+            print_port_troubleshooting_commands "$domain" "$desired_port"
           fi
         fi
       fi
@@ -2280,6 +2296,7 @@ modify_conf() {
           fi
         else
           warn "自动证书申请失败。通常是域名未解析到本机、80 端口未放行，或 CDN/防火墙拦截导致。"
+          print_port_troubleshooting_commands "$new_domain" "$new_listen"
         fi
       fi
     fi
@@ -3905,6 +3922,7 @@ enable_https_from_config_list() {
 
     if ! issue_cert_for_domain "$domain"; then
       error "自动申请证书失败，无法继续启用 HTTPS。请先修复解析或 80 端口可达性后重试。"
+      print_port_troubleshooting_commands "$domain" "$listen_port"
       return 1
     fi
   fi

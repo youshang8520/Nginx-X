@@ -46,7 +46,7 @@ bash install.sh
 - **Nginx 升级提示增强**：当无法访问或解析 nginx.org 最新版本时，提示更明确，并回退到包管理器升级检查。
 - **ACME / IPv6 增强**：HTTP-01 临时验证入口在系统 IPv6 可用时会同时监听 `80` 和 `[::]:80`，降低有 AAAA 记录时证书验证失败的概率。
 - **IPv6-only HTTPS 自动适配**：当用户选择 `443`，但 IPv4 `443` 已被其他服务占用时，脚本会自动检测 IPv6、AAAA 解析和证书条件，条件满足后只监听 `[::]:443 ipv6only=on`。
-- **端口自动放行与回滚**：配置成功落地后会尝试自动开放对应端口；CentOS 7/firewalld 环境优先使用 `systemctl` 启动 `firewalld`，再用 `firewall-cmd` 放行。脚本只记录并回滚自己新增的防火墙规则，不关闭用户原本已开放的端口。
+- **端口自动放行与回滚**：配置成功落地后会尝试自动开放 `80`、`443` 或用户输入的自定义 HTTPS 端口；CentOS 7/firewalld 环境优先使用 `systemctl` 启动 `firewalld`，再用 `firewall-cmd` 放行。脚本只记录并回滚自己新增的系统防火墙规则，不关闭用户原本已开放的端口；云厂商安全组仍需在服务商面板确认。
 - **保留上游修复**：已融合上游导入配置失败自动回滚的修复，避免导入失败后留下半成品配置。
 
 如果你想使用本 fork 的兼容版，请使用本文档里的 `youshang8520/Nginx-X` 安装命令，不要使用上游 `Xiuyixx/Nginx-X` 的 raw 安装地址。
@@ -58,7 +58,7 @@ bash install.sh
 - 所有配置变更都会先执行 `nginx -t`
 - 校验失败自动回滚，避免把在线 Nginx 配挂
 - 443 / HTTPS 端口复用场景会优先走更安全的落地流程
-- 证书申请前会做 HTTP-01 自检，并区分“软失败可继续”和“硬失败建议先修复”
+- 证书申请前会做 HTTP-01 自检；自检失败会取消申请并给出排查命令，避免继续触发 CA 验证失败
 - 临时文件使用安全随机文件名，降低冲突和误覆盖风险
 
 1. **安装升级Nginx**
@@ -89,7 +89,8 @@ bash install.sh
    - 若修改配置时更换域名且发现没有证书，可直接在流程中申请证书并启用 HTTPS
    - 添加完成后自动检测证书：
      - 若已有证书：仅需确认是否启用 HTTPS
-     - 若无证书：可一键“自动申请证书 + 自动启用 HTTPS（80→443）”
+     - 若无证书：可一键“自动申请证书 + 自动启用 HTTPS（80→目标 HTTPS 端口）”
+   - 如果 `443` 已被 sing-box 等服务占用，可输入自定义 HTTPS 端口。脚本会临时使用 `80` 完成 HTTP-01 证书验证，证书成功后在自定义端口启用 HTTPS，并配置 `80` 跳转到该 HTTPS 端口。
    - 配置列表：统一管理上述两类配置，按状态浏览并进入三级菜单执行 启用 / 停用 / 修改 / 编辑 / 删除
    - 导入已有配置：自动扫描 `conf.d/`、`sites-enabled/`、`sites-available/` 三个目录，发现未纳管的 Nginx 配置后逐个确认导入
    - 导入时自动提取域名、端口、后端地址、HTTPS 状态等元数据，不修改原有 Nginx 指令
@@ -131,13 +132,17 @@ bash install.sh
 
    如果只想先测试 IPv4 证书签发，可以暂时不加 AAAA；如果加了 AAAA，就必须确保 IPv6 的 80/443 也能公网访问。
 
-3. 放行 IPv6 的 80/443 端口：
+3. 确认 80/443 或自定义 HTTPS 端口可访问：
 
-   云厂商安全组、防火墙、系统防火墙都要检查。CentOS 7 常用命令：
+   脚本会在配置成功落地时自动放行系统防火墙端口（firewalld/ufw），包括 `80`、`443` 或你输入的自定义 HTTPS 端口。云厂商安全组不在服务器系统内，仍需要到服务商面板确认已放行。
+
+   CentOS 7/firewalld 可用下面命令手动确认或排查：
 
    ```bash
    firewall-cmd --permanent --add-service=http
    firewall-cmd --permanent --add-service=https
+   HTTPS_PORT=你的HTTPS端口
+   firewall-cmd --permanent --add-port=${HTTPS_PORT}/tcp
    firewall-cmd --reload
    firewall-cmd --list-all
    ```
@@ -166,6 +171,8 @@ bash install.sh
    - 证书申请成功、Nginx 校验通过后才落地最终配置
    - 任一步失败或用户取消，都不会写入半成品站点配置
 
+   如果 `443` 的 IPv4 和 IPv6 都被占用，可以直接输入自定义 HTTPS 端口。这不会影响证书签发，因为 HTTP-01 证书验证只要求域名的 `80` 端口可达；最终 HTTPS 会监听你输入的端口。
+
 6. 申请证书前做外部连通性检查：
 
    ```bash
@@ -180,7 +187,32 @@ bash install.sh
    ```bash
    curl -4 -I https://你的域名/
    curl -6 -I https://你的域名/
+   HTTPS_PORT=你的HTTPS端口
+   curl -4 -I https://你的域名:${HTTPS_PORT}/
+   curl -6 -I https://你的域名:${HTTPS_PORT}/
    ```
+
+端口和证书排查命令：
+
+```bash
+DOMAIN=你的域名
+HTTPS_PORT=你的HTTPS端口
+ss -lntp '( sport = :80 )'
+ss -lntp6 '( sport = :80 )'
+ss -lntp '( sport = :443 )'
+ss -lntp6 '( sport = :443 )'
+ss -lntp "( sport = :${HTTPS_PORT} )"
+ss -lntp6 "( sport = :${HTTPS_PORT} )"
+grep -R -n "listen .*80\|server_name ${DOMAIN}" /etc/nginx/
+nginx -t
+systemctl status nginx --no-pager
+firewall-cmd --get-active-zones
+firewall-cmd --list-all
+curl -4 -I "http://${DOMAIN}/"
+curl -6 -I "http://${DOMAIN}/"
+curl -4 -I "https://${DOMAIN}:${HTTPS_PORT}/"
+curl -6 -I "https://${DOMAIN}:${HTTPS_PORT}/"
+```
 
 常见问题：
 

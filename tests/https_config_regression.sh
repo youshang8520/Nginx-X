@@ -251,14 +251,15 @@ fi
 # shellcheck disable=SC2016
 grep -Fq 'return 301 https://$host$request_uri;' "$http_conf"
 
-custom_https_conf="$TMPDIR_ROOT/http-4443.conf"
-cat > "$custom_https_conf" <<'EOF'
+CUSTOM_HTTPS_PORT="$((4000 + RANDOM % 1000))"
+custom_https_conf="$TMPDIR_ROOT/http-custom.conf"
+cat > "$custom_https_conf" <<EOF
 # managed_by=Nginx-X
 # domain=example.com
-# listen_port=4443
+# listen_port=${CUSTOM_HTTPS_PORT}
 # backend_port=3000
 server {
-    listen 4443;
+    listen ${CUSTOM_HTTPS_PORT};
     server_name example.com;
 
     location / {
@@ -267,12 +268,12 @@ server {
 }
 EOF
 
-enable_https_for_conf_file "example.com" "$custom_https_conf" "4443"
-grep -q '^# listen_port=4443$' "$custom_https_conf"
-grep -q 'listen 4443 ssl http2;' "$custom_https_conf"
-grep -q 'listen \[::\]:4443 ssl http2;' "$custom_https_conf"
+enable_https_for_conf_file "example.com" "$custom_https_conf" "$CUSTOM_HTTPS_PORT"
+grep -q "^# listen_port=${CUSTOM_HTTPS_PORT}$" "$custom_https_conf"
+grep -q "listen ${CUSTOM_HTTPS_PORT} ssl http2;" "$custom_https_conf"
+grep -q "listen \[::\]:${CUSTOM_HTTPS_PORT} ssl http2;" "$custom_https_conf"
 # shellcheck disable=SC2016
-grep -Fq 'return 301 https://$host:4443$request_uri;' "$custom_https_conf"
+grep -Fq "return 301 https://\$host:${CUSTOM_HTTPS_PORT}\$request_uri;" "$custom_https_conf"
 grep -q "ssl_certificate     ${SSL_DIR}/example.com/fullchain.pem;" "$custom_https_conf"
 grep -q "ssl_certificate_key ${SSL_DIR}/example.com/privkey.pem;" "$custom_https_conf"
 
