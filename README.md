@@ -33,6 +33,22 @@ bash install.sh
 
 > **安装完成后可直接运行：`nx`**
 
+## 本 Fork 与上游差异
+
+本仓库基于 `Xiuyixx/Nginx-X`，保留上游功能的同时增加了一些兼容和部署增强，适合需要在 CentOS 7、老 Bash 或已安装过上游版本的服务器上使用。
+
+主要差异：
+
+- **安装源固定为本仓库**：一键安装会克隆 `https://github.com/youshang8520/Nginx-X.git`，避免继续拉取上游仓库。
+- **已安装目录来源检查**：如果 `/opt/Nginx-X` 已存在但 `remote.origin.url` 不是本仓库，安装器会提示并自动切换到本仓库版本。
+- **远程安装兼容**：修复 `curl | bash` 场景下误判当前目录为本地仓库的问题，支持 `FORCE_BOOTSTRAP=1` 强制走引导安装。
+- **CentOS 7 / 老 Bash 兼容**：替换依赖 Bash 新特性的数组读取写法，避免老系统中 `mapfile`、nameref 等兼容问题。
+- **Nginx 升级提示增强**：当无法访问或解析 nginx.org 最新版本时，提示更明确，并回退到包管理器升级检查。
+- **ACME / IPv6 增强**：HTTP-01 临时验证入口在系统 IPv6 可用时会同时监听 `80` 和 `[::]:80`，降低有 AAAA 记录时证书验证失败的概率。
+- **保留上游修复**：已融合上游导入配置失败自动回滚的修复，避免导入失败后留下半成品配置。
+
+如果你想使用本 fork 的兼容版，请使用本文档里的 `youshang8520/Nginx-X` 安装命令，不要使用上游 `Xiuyixx/Nginx-X` 的 raw 安装地址。
+
 ## 当前功能
 
 ### 稳定性设计
@@ -85,11 +101,80 @@ bash install.sh
 - **对外监听（客户端通过 IPv6 访问）**：脚本在生成配置时会进行最佳努力检测，若系统 IPv6 已启用，会额外写入：
   - `listen [::]:80;`
   - `listen [::]:443 ssl;`（或对应的 HTTPS 监听端口）
+- **ACME HTTP-01 验证**：临时验证入口在 IPv6 可用时也会写入 `listen [::]:80;`，适配有 AAAA 记录的域名。
 - **上游反代到 IPv6**：支持上游 URL 使用 IPv6（需要按 URL 规范使用方括号），例如：
   - `http://[2001:db8::1]:8080`
   - `https://[2400:3200::1]`
 
 > 注意：若你的系统内核禁用了 IPv6（例如 `net.ipv6.conf.all.disable_ipv6=1`），脚本会自动跳过 IPv6 的 `listen` 行，避免 `nginx -t` 失败。
+
+### IPv6 用户使用步骤
+
+如果服务器本身支持 IPv6，建议按下面顺序确认：
+
+1. 确认系统 IPv6 已启用：
+
+   ```bash
+   sysctl net.ipv6.conf.all.disable_ipv6
+   ip -6 addr
+   ```
+
+   `net.ipv6.conf.all.disable_ipv6 = 0` 表示系统未禁用 IPv6；`ip -6 addr` 应能看到公网 IPv6 地址。
+
+2. 在 DNS 服务商处添加记录：
+
+   - `A` 记录：域名指向服务器 IPv4
+   - `AAAA` 记录：域名指向服务器 IPv6
+
+   如果只想先测试 IPv4 证书签发，可以暂时不加 AAAA；如果加了 AAAA，就必须确保 IPv6 的 80/443 也能公网访问。
+
+3. 放行 IPv6 的 80/443 端口：
+
+   云厂商安全组、防火墙、系统防火墙都要检查。CentOS 7 常用命令：
+
+   ```bash
+   firewall-cmd --permanent --add-service=http
+   firewall-cmd --permanent --add-service=https
+   firewall-cmd --reload
+   firewall-cmd --list-all
+   ```
+
+4. 安装或更新本 fork：
+
+   ```bash
+   bash -c "$(curl -fsSL https://raw.githubusercontent.com/youshang8520/Nginx-X/main/install.sh)"
+   ```
+
+5. 运行脚本并添加配置：
+
+   ```bash
+   nx
+   ```
+
+   在“配置管理”里选择“添加配置”或“外部反代”。脚本检测到 IPv6 可用时，会自动生成 IPv6 监听行。
+
+6. 申请证书前做外部连通性检查：
+
+   ```bash
+   curl -4 -I http://你的域名/
+   curl -6 -I http://你的域名/
+   ```
+
+   如果 `curl -6` 失败，而域名已经有 AAAA 记录，Let's Encrypt 可能会通过 IPv6 访问失败，导致 HTTP-01 验证失败。此时应先修复 IPv6 防火墙/安全组，或者临时删除 AAAA 记录后再申请证书。
+
+7. 申请证书后再检查 HTTPS：
+
+   ```bash
+   curl -4 -I https://你的域名/
+   curl -6 -I https://你的域名/
+   ```
+
+常见问题：
+
+- 有 AAAA 记录但 IPv6 80 端口不通：证书申请可能失败。
+- Nginx 配置里没有 `[::]` 监听：通常是系统禁用了 IPv6，检查 `sysctl net.ipv6.conf.all.disable_ipv6`。
+- 后端是 IPv6 地址：上游 URL 必须使用方括号，例如 `http://[2400:3200::1]:8096`。
+- 使用 CDN 时：确认 CDN 的 IPv6 回源、HTTP-01 路径和 80 端口策略没有拦截。
 
 3. **证书管理**
    - 设置邮箱（持久化到 `${XDG_CONFIG_HOME:-$HOME/.config}/nginxx/email.conf`）
